@@ -698,11 +698,9 @@ export default {
 			}
 		},
 		onLoginRechargeTap() {
-			// 显示开发中提示
-			uni.showToast({
-				title: '开发中，敬请期待',
-				icon: 'none',
-				duration: 2000
+			// 跳转到登录/注册页面
+			uni.navigateTo({
+				url: '/pages/auth/index'
 			})
 		}
 	}
