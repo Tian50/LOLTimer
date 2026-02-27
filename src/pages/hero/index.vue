@@ -1,7 +1,12 @@
 <template>
 	<view class="page" :class="'theme-' + currentTheme">
+		<!-- 右上角：主题切换 -->
 		<view class="theme-toggle" @tap="toggleTheme">
 			<text class="theme-icon">🎨</text>
+		</view>
+		<!-- 左上角：登录状态与退出登录 -->
+		<view v-if="isLoggedIn" class="logout-badge" @tap="onLogoutTap">
+			<text class="logout-text">退出登录</text>
 		</view>
 		<view class="content">
 			<view class="row" v-for="role in roles" :key="role.key">
@@ -50,9 +55,17 @@
 				</view>
 			</view>
 		</view>
-		<!-- 底部按钮 -->
-		<view class="bottom-button" @tap="onLoginRechargeTap">
-			<text class="bottom-button-text">登录充值可享语音操控</text>
+		<!-- 底部按钮：未登录时提示去登录，已登录时显示麦克风图标 -->
+		<view class="bottom-button" @tap="onBottomButtonTap">
+			<view v-if="!isLoggedIn" class="bottom-login-wrapper">
+				<text class="bottom-button-text">登录充值可享语音操控</text>
+			</view>
+			<view v-else class="bottom-mic-wrapper">
+				<view class="mic-circle">
+					<text class="mic-icon">🎤</text>
+				</view>
+				<text class="mic-label">语音操控</text>
+			</view>
 		</view>
 		<!-- 技能选择弹窗 -->
 		<view v-if="showSpellModal" class="modal-mask" @tap="closeSpellModal">
@@ -119,9 +132,16 @@
 </template>
 
 <script>
+import voiceRecognizer from '@/common/voice-recognizer.js'
+import { parseSummonerCommand } from '@/common/voice-summoner-parser.js'
+
 export default {
 		data() {
 		return {
+			// 与后端对接的基础地址，用于退出登录接口
+			baseURL: 'https://catfnsmlquaw.sealosbja.site',
+			// 是否已登录的简单标记：本地是否存在 LOLTimerToken
+			isLoggedIn: false,
 			/* 当前主题：'purple' 或 'blue' */
 			currentTheme: 'purple',
 			roles: [
@@ -228,11 +248,17 @@ export default {
 			/* 已移除的装备列表（按移除顺序，用于排序） */
 			removedEquips: [],
 			/* 待添加的装备队列（用于处理快速连续点击） */
-			pendingAddQueue: []
+			pendingAddQueue: [],
+			/* 语音相关状态 */
+			recognizing: false,
+			lastVoiceText: '',
+			lastVoiceCommand: null
 		}
 	},
 	created() {
 		this.initCountdownState()
+		// 初始化登录状态
+		this.updateLoginState()
 		// 从本地存储读取主题
 		try {
 			const savedTheme = uni.getStorageSync('appTheme')
@@ -243,7 +269,20 @@ export default {
 			console.error('读取主题失败', e)
 		}
 	},
+	onShow() {
+		// 从登录/注册页返回时刷新登录状态
+		this.updateLoginState()
+	},
 	methods: {
+		updateLoginState() {
+			try {
+				const token = uni.getStorageSync('LOLTimerToken')
+				this.isLoggedIn = !!token
+			} catch (e) {
+				console.error('读取登录状态失败', e)
+				this.isLoggedIn = false
+			}
+		},
 		toggleTheme() {
 			// 循环切换主题：purple -> blue -> green -> purple
 			const themes = ['purple', 'blue', 'green']
@@ -697,13 +736,176 @@ export default {
 				this.$set(this.equipTimerMap[roleKey], idx, null)
 			}
 		},
-		onLoginRechargeTap() {
-			// 显示开发中提示
-			uni.showToast({
-				title: '开发中，敬请期待',
-				icon: 'none',
-				duration: 2000
+		// 公共退出登录逻辑
+		doLogoutRequest() {
+			const token = uni.getStorageSync('LOLTimerToken')
+
+			// 即使没有 token，也按照“前端应清理本地缓存”的建议清理本地并提示
+			const doLocalLogout = () => {
+				try {
+					uni.removeStorageSync('LOLTimerToken')
+					uni.removeStorageSync('LOLTimerRefreshToken')
+					uni.removeStorageSync('LOLTimerCurrentUser')
+				} catch (e) {
+					console.error('清理本地登录状态失败', e)
+				}
+				this.isLoggedIn = false
+			}
+
+			// 调用后端退出登录接口：POST /api/auth/logout
+			uni.request({
+				url: this.baseURL + '/api/auth/logout',
+				method: 'POST',
+				header: {
+					'Content-Type': 'application/json',
+					// 根据文档，受保护接口在 Header 中带上 Access Token
+					Authorization: token ? `Bearer ${token}` : ''
+				},
+				success: (res) => {
+					const resp = res.data || {}
+					// 无论接口是否成功，前端都应清理本地缓存
+					doLocalLogout()
+					if (resp.code === 0) {
+						uni.showToast({
+							title: resp.message || '退出登录成功',
+							icon: 'success',
+							duration: 1500
+						})
+					} else {
+						uni.showToast({
+							title: resp.message || '已退出登录',
+							icon: 'none',
+							duration: 1500
+						})
+					}
+				},
+				fail: (err) => {
+					console.error('退出登录请求失败', err)
+					// 按文档建议，失败也要清理本地状态
+					doLocalLogout()
+					uni.showToast({
+						title: '网络异常，本地已退出登录',
+						icon: 'none',
+						duration: 1500
+					})
+				}
 			})
+		},
+		onLogoutTap() {
+			// 左上角“退出登录”按钮
+			this.doLogoutRequest()
+		},
+		onBottomButtonTap() {
+			if (!this.isLoggedIn) {
+				// 未登录：跳转到登录/注册页面
+				uni.navigateTo({
+					url: '/pages/auth/index'
+				})
+				return
+			}
+
+			// 已登录：触发语音识别
+			if (this.recognizing) {
+				// 再次点击则停止
+				this.stopVoiceRecognize()
+			} else {
+				this.startVoiceRecognize()
+			}
+		},
+		startVoiceRecognize() {
+			if (!voiceRecognizer.isSupported()) {
+				uni.showToast({
+					title: '当前环境不支持语音识别',
+					icon: 'none'
+				})
+				return
+			}
+			this.recognizing = true
+			voiceRecognizer.startRecognize(
+				(text, command) => {
+					this.recognizing = false
+					this.lastVoiceText = text
+					this.lastVoiceCommand = command
+					this.applyVoiceCommand(command)
+				},
+				(errMsg) => {
+					this.recognizing = false
+					uni.showToast({
+						title: errMsg || '语音识别失败',
+						icon: 'none'
+					})
+				},
+				{
+					lang: 'zh-cn',
+					timeout: 30000
+				}
+			)
+		},
+		stopVoiceRecognize() {
+			voiceRecognizer.stopRecognize()
+			this.recognizing = false
+		},
+		applyVoiceCommand(command) {
+			if (!command) return
+			const laneKey = this.mapLaneToRoleKey(command.lane)
+			if (!laneKey) return
+
+			// 先简单处理：只看第一条 spell
+			const spell = command.spells && command.spells[0]
+			if (!spell || !spell.name || spell.name === 'unknown') return
+
+			// 根据当前位置的两个召唤师技能，找到匹配的格子
+			const roleSpells = this.spells[laneKey] || []
+			const idx = roleSpells.findIndex(k => k === spell.name)
+			if (idx === -1) {
+				// 找不到完全相同的，就不自动触发
+				return
+			}
+
+			if (spell.status === 'used') {
+				// 刚交技能：如果当前已经在计时中，则不重复重置 CD，避免误触
+				const currentRemain = this.getRemain(laneKey, idx)
+				if (currentRemain > 0) {
+					return
+				}
+				// 未在计时中，使用现有 onSkillTap 逻辑，按默认 CD 开始计时
+				this.onSkillTap(laneKey, idx)
+			} else if (spell.status === 'cooldown' && typeof spell.remainingSeconds === 'number') {
+				// 带剩余时间：直接设置剩余秒数并启动倒计时
+				this.clearTimer(laneKey, idx)
+				if (!this.remainMap[laneKey]) return
+				this.$set(this.remainMap[laneKey], idx, spell.remainingSeconds)
+				// 启动动画
+				this.$set(this.animMap[laneKey], idx, false)
+				this.$nextTick(() => {
+					this.$set(this.animMap[laneKey], idx, true)
+					setTimeout(() => {
+						this.$set(this.animMap[laneKey], idx, false)
+					}, 500)
+				})
+				const timer = setInterval(() => {
+					const cur = this.remainMap[laneKey][idx]
+					if (cur <= 1) {
+						this.clearTimer(laneKey, idx)
+						this.$set(this.remainMap[laneKey], idx, 0)
+						return
+					}
+					this.$set(this.remainMap[laneKey], idx, cur - 1)
+				}, 1000)
+				this.$set(this.timerMap[laneKey], idx, timer)
+			} else if (spell.status === 'ready') {
+				// 技能已好：清零这个格子的计时
+				this.onSkillDoubleClick(laneKey, idx)
+			}
+		},
+		mapLaneToRoleKey(lane) {
+			// 解析结果中的 lane 映射到当前页面 roles 的 key
+			if (lane === 'top') return 'top'
+			if (lane === 'mid') return 'mid'
+			if (lane === 'adc' || lane === 'bot') return 'adc'
+			if (lane === 'sup') return 'sup'
+			if (lane === 'jg' || lane === 'jungle') return 'jg'
+			return null
 		}
 	}
 }
@@ -737,6 +939,27 @@ export default {
 .theme-icon {
 	font-size: 36rpx;
 	line-height: 1;
+}
+
+/* 左上角退出登录 */
+.logout-badge {
+	position: fixed;
+	top: 64rpx;
+	left: 24rpx;
+	padding: 8rpx 20rpx;
+	border-radius: 999rpx;
+	background: rgba(0, 0, 0, 0.28);
+	backdrop-filter: blur(10rpx);
+	border: 1rpx solid rgba(255, 255, 255, 0.4);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	z-index: 100;
+}
+
+.logout-text {
+	font-size: 22rpx;
+	color: #ffffff;
 }
 
 /* 主题1：紫色 */
@@ -1435,6 +1658,40 @@ export default {
 	font-weight: 600;
 	color: #303133;
 	letter-spacing: 1rpx;
+}
+
+.bottom-login-wrapper {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+}
+
+.bottom-mic-wrapper {
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	gap: 16rpx;
+}
+
+.mic-circle {
+	width: 68rpx;
+	height: 68rpx;
+	border-radius: 50%;
+	background: linear-gradient(135deg, #ffcc33 0%, #ff9933 40%, #ff6699 100%);
+	display: flex;
+	align-items: center;
+	justify-content: center;
+	box-shadow: 0 6rpx 18rpx rgba(0, 0, 0, 0.24);
+}
+
+.mic-icon {
+	font-size: 36rpx;
+}
+
+.mic-label {
+	font-size: 26rpx;
+	font-weight: 600;
+	color: #303133;
 }
 
 /* 主题适配 */
